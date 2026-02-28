@@ -2,6 +2,7 @@ import express, { Express, Request, Response } from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import submissionsRouter from './routes/submissions';
+import geocodeRouter from './routes/geocode';
 import paymentRouter from './routes/payments';
 import { errorHandler } from './middleware/errorHandler';
 
@@ -20,6 +21,7 @@ app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
 // Routes
 app.use('/api/submissions', submissionsRouter);
+app.use('/api/geocode', geocodeRouter);
 app.use('/api/payments', paymentRouter);
 
 // Health check
