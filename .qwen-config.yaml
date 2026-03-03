@@ -1,0 +1,7 @@
+model: qwen3-coder
+autonomy: full
+iterations: 5
+timeout: 3600
+repository: ~/Documents/GitHub/strony/palmo-trans-calculator-backend
+logging: verbose
+CONFIG

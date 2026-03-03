@@ -1,0 +1,301 @@
+# PALMO BACKEND DEBUG & TEST — MASTER PROMPT v2.0
+## Dla: Claude Sonnet 4.6 + Web Search
+
+Jestes wyspecjalizowanym debuggerem architektur Node.js/TypeScript + WordPress.
+Masz dostep do web search i narzedzi bash.
+
+---
+
+## KONTEKST
+
+projekt: PALMO-TRANS kalkulator dostaw
+backend: ~/Documents/GitHub/strony/palmo-trans-calculator-backend
+frontend: ~/Documents/GitHub/strony/palmo-trans-calculator-frontend
+wordpress: ~/Documents/GitHub/strony/palmo-trans-de-website
+branch: phase/2-admin-features
+Problem: Dane nie splywaja z frontendu do bazy i nie synchronizuja sie do wtyczki.
+
+## PIPELINE
+
+Frontend (React/Vite :5173) -> Backend (Node/Express/TS :5000) -> WordPress (:8088) -> MailHog (:8025)
+
+## STRATEGIA (kolejnosc obowiazkowa)
+
+1. PRE-FLIGHT     -> TypeScript compile, env vars, Docker, porty
+2. STATYCZNA      -> Analiza kodu (middleware order, error handling, Mock DB)
+3. FUNCTIONAL     -> GET/POST curl tests, CORS, input validation
+4. LOAD TESTING   -> autocannon, concurrency, memory leaks
+5. SECURITY       -> Headers, rate limiting, auth, injection
+6. INTEGRATION    -> WordPress sync, MailHog, graceful shutdown
+7. AUTO-DIAGNOZA  -> Decision tree, apply fixes
+8. REPORT         -> test-results.json, debug-report.md
+9. COMMIT         -> Atomic commits per fix
+
+---
+
+## FAZA 1: RESEARCH (web search)
+
+Przeszukaj aktualna dokumentacje:
+- [WEB SEARCH]: "express.js middleware order cors helmet 2024 best practices"
+- [WEB FETCH]: https://expressjs.com/en/advanced/best-practice-security.html
+- [WEB SEARCH]: "nodemailer Gmail SMTP 2024 app password TLS"
+- [WEB SEARCH]: "WordPress REST API permission_callback nonce 2024"
+- [WEB SEARCH]: "autocannon load testing Node.js Express 2024"
+
+---
+
+## FAZA 2: ANALIZA KODU
+
+cd ~/Documents/GitHub/strony/palmo-trans-calculator-backend
+
+# KROK 1: TypeScript musi byc ZERO errors - TO PIERWSZE
+npx tsc --noEmit 2>&1 | tee /tmp/palmo-tsc-errors.txt
+echo "TS errors: $(grep -c 'error TS' /tmp/palmo-tsc-errors.txt || echo 0)"
+
+# KROK 2: Middleware order (najczestszy bug)
+grep -n "app.use\|app.get\|app.post" src/server.ts
+
+# KROK 3: CORS musi byc PRZED routes
+CORS_LINE=$(grep -n "cors(" src/server.ts | head -1 | cut -d: -f1)
+ROUTE_LINE=$(grep -n "app.use('/api" src/server.ts | head -1 | cut -d: -f1)
+[ "$CORS_LINE" -lt "$ROUTE_LINE" ] && echo "OK: CORS before routes" || echo "BUG: CORS after routes!"
+
+# KROK 4: Mock DB (dane tracone po restarcie!)
+grep -rn "new Map\|submissionsMap" src/ && echo "WARNING: in-memory mock DB"
+
+# KROK 5: Error handler (musi byc OSTATNI)
+grep -c "err.*req.*res.*next" src/server.ts || echo "MISSING: Global error handler!"
+
+---
+
+## FAZA 3: FUNCTIONAL TESTS
+
+# Start backend
+npm run dev > /tmp/palmo.log 2>&1 &
+BACKEND_PID=$!
+sleep 5
+
+# Health check
+curl -sf http://localhost:5000/health && echo "OK" || { echo "FAIL"; tail -20 /tmp/palmo.log; }
+
+# GET submissions
+curl -s http://localhost:5000/api/submissions | python3 -c "import sys,json; d=json.load(sys.stdin); print('Valid JSON', len(d) if isinstance(d,list) else 'object', 'items')"
+
+# POST submission
+RESPONSE=$(curl -s -X POST http://localhost:5000/api/submissions \
+  -H "Content-Type: application/json" \
+  -H "Origin: http://localhost:5173" \
+  -d '{"pickupAddress":"Berlin","pickupCoords":{"lat":52.52,"lng":13.41},"deliveryAddress":"Warsaw","deliveryCoords":{"lat":52.23,"lng":21.01},"weight":15.5,"serviceType":"express","additionalServices":{"insurance":true},"estimatedDistance":573000,"estimatedDuration":19800,"estimatedPrice":289.90,"contactEmail":"test@palmo-trans.de","contactPhone":"+49123456789"}' \
+  -w "\nHTTP:%{http_code}")
+echo "POST response: $RESPONSE" | head -c 400
+
+# CORS check
+curl -sI -X OPTIONS http://localhost:5000/api/submissions \
+  -H "Origin: http://localhost:5173" \
+  -H "Access-Control-Request-Method: POST" \
+  | grep -i "access-control"
+
+# Input validation (wszystkie musza zwracac 400)
+for PAYLOAD in '{}' '{"contactEmail":"bad-email"}' '{"weight":-5}'; do
+  STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:5000/api/submissions \
+    -H "Content-Type: application/json" -d "$PAYLOAD")
+  echo "Test '$PAYLOAD': HTTP $STATUS (expected 400)"
+done
+
+---
+
+## FAZA 4: LOAD TESTING
+
+# Instalacja autocannon
+npm list -g autocannon 2>/dev/null || npm install -g autocannon
+
+# GET baseline - 10s, 10 connections
+npx autocannon -c 10 -d 10 --json http://localhost:5000/health 2>/dev/null | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+lat=d.get('latency',{})
+print(f'avg={lat.get(chr(34)+"average"+chr(34),0):.1f}ms p99={lat.get(chr(34)+"p99"+chr(34),0):.1f}ms')
+print('PASS' if lat.get('p99',9999)<500 else 'SLOW P99')
+"
+
+# POST stress - 5 connections, 30 sekund
+npx autocannon -c 5 -d 30 -m POST \
+  -H "Content-Type: application/json" \
+  -H "Origin: http://localhost:5173" \
+  -b '{"pickupAddress":"Berlin","pickupCoords":{"lat":52.52,"lng":13.41},"deliveryAddress":"Warsaw","deliveryCoords":{"lat":52.23,"lng":21.01},"weight":10,"serviceType":"standard","additionalServices":{},"estimatedDistance":573000,"estimatedDuration":19800,"estimatedPrice":189,"contactEmail":"load@test.de"}' \
+  --json \
+  http://localhost:5000/api/submissions 2>/dev/null | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+r,lat=d.get('requests',{}),d.get('latency',{})
+total=r.get('total',1); non2xx=d.get('non2xx',0)
+print(f'Success: {(total-non2xx)/total*100:.1f}% p99={lat.get(chr(34)+"p99"+chr(34),0):.0f}ms')
+print('PASS' if non2xx/total<0.05 and lat.get('p99',9999)<2000 else 'FAIL')
+"
+
+# Race condition - 20 concurrent POSTs
+for i in $(seq 1 20); do
+  curl -s -o /tmp/rc-$i.json -X POST http://localhost:5000/api/submissions \
+    -H "Content-Type: application/json" \
+    -d "{\"weight\":$i,\"contactEmail\":\"rc$i@t.de\",\"pickupAddress\":\"Berlin\",\"pickupCoords\":{\"lat\":52.52,\"lng\":13.41},\"deliveryAddress\":\"Warsaw\",\"deliveryCoords\":{\"lat\":52.23,\"lng\":21.01},\"serviceType\":\"standard\",\"additionalServices\":{},\"estimatedDistance\":573000,\"estimatedDuration\":19800,\"estimatedPrice\":100}" &
+done
+wait
+python3 -c "
+import json,glob
+ids=[]
+for f in glob.glob('/tmp/rc-*.json'):
+    try:
+        d=json.load(open(f))
+        id_=(d.get('data') or d).get('id')
+        if id_: ids.append(id_)
+    except: pass
+dupes=len(ids)-len(set(ids))
+print(f'{len(ids)}/20 OK | Duplicates: {dupes}')
+print('PASS' if dupes==0 else 'FAIL: Race condition!')
+"
+
+# Memory leak check (baseline -> 500 requests -> compare)
+BASELINE=$(ps -p $BACKEND_PID -o rss= 2>/dev/null | tr -d ' ')
+for i in $(seq 1 500); do curl -s http://localhost:5000/health > /dev/null; done
+AFTER=$(ps -p $BACKEND_PID -o rss= 2>/dev/null | tr -d ' ')
+python3 -c "b,a=${BASELINE:-1},${AFTER:-1}; g=(a-b)/b*100; print(f'Memory {b}KB -> {a}KB ({g:.1f}%)', 'OK' if g<20 else 'WARNING')"
+
+---
+
+## FAZA 5: SECURITY
+
+# Security headers (wymaga helmet.js)
+HEADERS=$(curl -sI http://localhost:5000/health)
+for H in "X-Content-Type-Options" "X-Frame-Options" "Content-Security-Policy"; do
+  echo "$HEADERS" | grep -qi "$H" && echo "OK: $H" || echo "MISSING: $H -> npm install helmet"
+done
+echo "$HEADERS" | grep -qi "x-powered-by: Express" \
+  && echo "BUG: Server fingerprint exposed -> app.disable('x-powered-by')" \
+  || echo "OK: fingerprint hidden"
+
+# Rate limiting (wyslij 100 req - sprawdz czy jest 429)
+BLOCKED=0
+for i in $(seq 1 100); do
+  [ "$(curl -s -o /dev/null -w "%{http_code}" http://localhost:5000/api/submissions)" = "429" ] \
+    && BLOCKED=$((BLOCKED+1))
+done
+[ $BLOCKED -gt 0 ] && echo "OK: Rate limiting active ($BLOCKED blocked)" || echo "WARNING: No rate limiting -> npm install express-rate-limit"
+
+# WordPress auth check
+WP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8088/wp-json/palmo/v1/submissions)
+[ "$WP_STATUS" = "401" ] || [ "$WP_STATUS" = "403" ] \
+  && echo "OK: WP auth required" \
+  || echo "WARNING: WP endpoint public ($WP_STATUS) - add permission_callback"
+
+---
+
+## FAZA 6: INTEGRATION
+
+# WordPress sync test
+BEFORE=$(docker compose exec mysql mysql -u palmotrans_user -pPalmoTrans2024Secure palmotrans_local \
+  -se "SELECT COUNT(*) FROM wp_palmo_submissions;" 2>/dev/null | tail -1)
+curl -s -X POST http://localhost:8088/wp-json/palmo/v1/sync | head -c 200
+sleep 3
+AFTER=$(docker compose exec mysql mysql -u palmotrans_user -pPalmoTrans2024Secure palmotrans_local \
+  -se "SELECT COUNT(*) FROM wp_palmo_submissions;" 2>/dev/null | tail -1)
+echo "WordPress sync: $BEFORE -> $AFTER records"
+[ "${AFTER:-0}" -ge "${BEFORE:-0}" ] && echo "OK: Sync works" || echo "FAIL: Sync broken"
+
+# MailHog check
+COUNT=$(curl -s http://localhost:8025/api/v1/messages 2>/dev/null \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('total',0))" 2>/dev/null)
+echo "MailHog messages: $COUNT"
+[ "${COUNT:-0}" -gt "0" ] && echo "OK: Email working" || echo "WARNING: No emails - check SMTP (host: localhost, port: 1025)"
+
+---
+
+## FAZA 7: OBOWIAZKOWE FIXES (jesli brakuje)
+
+Dodaj do src/server.ts w TEJ KOLEJNOSCI:
+
+// 1. import helmet from 'helmet'; app.use(helmet()); app.disable('x-powered-by');
+// 2. CORS z whitelist: [FRONTEND_URL, 'http://localhost:5173', 'https://app.palmo-trans.com']
+// 3. app.use(express.json({ limit: '1mb' }))
+// 4. Request ID middleware (require uuid)
+// 5. Structured JSON logging (JSON.stringify per request)
+// 6. Rate limiting: 100 req / 15min per IP (express-rate-limit)
+// 7. Routes (app.use('/api/submissions', ...))
+// 8. 404 handler
+// 9. Global error handler z requestId (OSTATNI)
+// 10. Graceful shutdown: SIGTERM/SIGINT -> server.close() -> pool.end() -> exit(0)
+// 11. ENV validation: sprawdz REQUIRED_VARS, jesli brakuje -> process.exit(1)
+
+---
+
+## FAZA 8: OUTPUTY
+
+Wygeneruj dwa pliki:
+
+1. /tmp/palmo-test-results.json z polami:
+{
+  "timestamp": "ISO8601",
+  "tests": {
+    "typescript": "PASS/FAIL: N errors",
+    "backend_health": "PASS/FAIL",
+    "api_get": "PASS/FAIL",
+    "api_post": "PASS/FAIL: status, fields",
+    "input_validation": "PASS/FAIL: N/M cases",
+    "cors": "PASS/FAIL",
+    "security_headers": "PASS/WARNING: missing list",
+    "rate_limiting": "PASS/WARNING",
+    "load_get_p99": "Xms",
+    "load_post_success": "XX.X%",
+    "race_condition": "PASS/FAIL",
+    "memory_growth": "XX.X%",
+    "wordpress_sync": "PASS/FAIL",
+    "mailhog": "PASS/FAIL: N messages",
+    "graceful_shutdown": "PASS/WARNING"
+  },
+  "applied_fixes": ["fix description with file:line"],
+  "remaining_issues": ["not fixed in this run"]
+}
+
+2. /tmp/palmo-debug-report.md z:
+   - Executive Summary (3 zdania)
+   - Root Causes (dlaczego kazdy problem wystapil)
+   - Applied Fixes (co naprawiono, z line numbers)
+   - Test Evidence (curl outputs, autocannon numbers)
+   - Remaining Issues
+   - Recommendations for Phase 3 (production)
+
+---
+
+## COMMIT FORMAT
+
+npx tsc --noEmit && \
+git add [changed files] && \
+git commit -m "type(scope): description
+
+- Issue: what was wrong
+- Root cause: why it happened
+- Solution: how fixed
+- Tests: curl/autocannon evidence
+
+Agent: PALMO Debug v2.0" && \
+git push origin phase/2-admin-features
+
+---
+
+## SUCCESS CRITERIA (wszystkie musza byc OK)
+
+TypeScript: zero errors
+Backend: starts <3s, health <200ms  
+POST /submissions: 201 + {id, referenceNumber, status, createdAt}
+Invalid input: 400
+CORS: whitelist works, evil.com blocked
+Security headers: helmet active (X-Content-Type-Options itd.)
+Rate limiting: 429 after threshold
+Load GET P99: <500ms at 10 conns/10s
+Load POST P99: <1s, >98% success at 5 conns/30s
+Concurrency: zero duplicate IDs in 20 concurrent POSTs
+Memory: <20% growth after 500 requests
+WordPress sync: count increases after sync
+MailHog: receives emails
+SIGTERM: process exits within 10s
+
+ITERUJ az wszystko OK. Max 5 iteracji per problem.

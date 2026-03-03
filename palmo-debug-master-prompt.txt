@@ -1,0 +1,400 @@
+# PALMO BACKEND DEBUG & TEST — MASTER PROMPT
+## Dla: Claude Sonnet 4.6 + Web Search
+
+Jesteś wyspecjalizowanym debuggerem i testером architektur Node.js + WordPress.
+
+ZADANIE GŁÓWNE:
+Przeprowadź komprehensywny debug pipeline'u: Frontend → Backend → WordPress Sync
+Problem: Dane nie spływają z frontendu do bazy danych i nie synchronizują się do wtyczki.
+
+---
+
+## FAZA 1: RESEARCH & ANALYSIS (20 min)
+
+### 1.1 Przeszukaj Oficjalną Dokumentację:
+- [ ] Express.js error handling: https://expressjs.com/en/guide/error-handling.html
+- [ ] TypeScript type safety: https://www.typescriptlang.org/docs/handbook/
+- [ ] PayPal Checkout: https://developer.paypal.com/docs/checkout/
+- [ ] Node.js streams & events: https://nodejs.org/en/docs/guides/
+- [ ] WordPress REST API security: https://developer.wordpress.org/rest-api/using-the-rest-api/
+- [ ] Nodemailer SMTP: https://nodemailer.com/smtp/
+
+### 1.2 Analizuj Repozytoria:
+GitHub URLs:
+- Frontend: https://github.com/piotroq/palmo-trans-calculator-frontend
+- Backend: https://github.com/piotroq/palmo-trans-calculator-backend
+- WordPress: https://github.com/PB-MEDIA-Strony-Sklepy-Marketing/palmo-trans-de-website
+
+Sprawdź:
+- package.json (dependencies, versions)
+- .env.example vs .env.local
+- src/server.ts — route registration
+- src/routes/submissions.ts — POST handler
+- src/services/emailService.ts — SMTP config
+- Error handling patterns
+- CORS configuration
+- Database connection pooling
+
+### 1.3 Zidentyfikuj Potencjalne Problemy:
+- [ ] CORS headers missing/misconfigured
+- [ ] Environment variables not loaded
+- [ ] TypeScript compilation errors
+- [ ] Route not registered correctly
+- [ ] Database connection issues
+- [ ] Middleware order (CORS musi być PRZED routes)
+- [ ] JSON parsing errors
+- [ ] Port conflicts (5000, 8088, 3306)
+- [ ] Email service SMTP misconfiguration
+- [ ] WordPress REST API permission issues
+
+---
+
+## FAZA 2: DIAGNOSTIC COMMANDS (15 min)
+
+Wygeneruj i opisz:
+
+### 2.1 System Health Check
+```bash
+# Ports check
+lsof -i :5000 :8088 :3306 :1025
+
+# Node.js version & npm
+node --version && npm --version
+
+# Git status
+cd ~/Documents/GitHub/strony/palmo-trans-calculator-backend && git status && git log --oneline -5
+
+# Environment
+cat .env.local | grep -E "API|BACKEND|FRONTEND|PORT|DB"
+
+# Dependencies
+npm list express typescript ts-node
+```
+
+### 2.2 Backend Startup Test
+```bash
+# Start with verbose logging
+npm run dev 2>&1 | head -50
+
+# Wait 5 seconds then test
+sleep 5
+curl -v http://localhost:5000/health
+
+# Test with detailed output
+curl -v -X GET http://localhost:5000/api/submissions 2>&1 | grep -E "^(<|>|{)" | head -20
+```
+
+### 2.3 Database Connectivity
+```bash
+# Docker check
+docker ps | grep -E "mysql|wordpress|php"
+
+# Database test
+docker compose exec mysql mysql -u palmotrans_user -pPalmoTrans2024Secure palmotrans_local -e "SELECT VERSION();"
+
+# Check tables
+docker compose exec mysql mysql -u palmotrans_user -pPalmoTrans2024Secure palmotrans_local -e "SHOW TABLES; DESCRIBE wp_palmo_submissions;"
+```
+
+### 2.4 Network Connectivity
+```bash
+# Test routes (from backend container perspective)
+docker compose exec wordpress curl http://mysql:3306 2>&1
+
+# Test API from WordPress
+docker compose exec wordpress curl http://localhost:5000/health 2>&1
+
+# Check network
+docker network inspect palmo-trans-de-website_palmotrans_net | jq '.Containers'
+```
+
+---
+
+## FAZA 3: DATA FLOW TESTING (20 min)
+
+### Test 1: POST Submission to Backend
+```bash
+PAYLOAD=$(cat <<'JSON'
+{
+  "pickupAddress": "Berlin, Germany",
+  "pickupCoords": {"lat": 52.52, "lng": 13.41},
+  "deliveryAddress": "Warsaw, Poland",
+  "deliveryCoords": {"lat": 52.23, "lng": 21.01},
+  "weight": 15,
+  "serviceType": "express",
+  "additionalServices": {"insurance": true, "signatureRequired": false},
+  "estimatedDistance": 350000,
+  "estimatedDuration": 14400,
+  "estimatedPrice": 245.50,
+  "contactEmail": "test@example.com",
+  "contactPhone": "+48123456789",
+  "notes": "Debug test"
+}
+JSON
+)
+
+curl -X POST http://localhost:5000/api/submissions \
+  -H "Content-Type: application/json" \
+  -d "$PAYLOAD" \
+  -v 2>&1 | tee /tmp/backend-response.txt
+
+# Analyze response
+cat /tmp/backend-response.txt | grep -E "^(<|>|{|\")" | head -30
+```
+
+### Test 2: Verify Data in Backend (Mock DB)
+```bash
+# If using mock Map-based DB, check memory
+curl http://localhost:5000/api/submissions 2>&1 | jq '.' | head -50
+
+# Check line count (how many records?)
+curl http://localhost:5000/api/submissions 2>&1 | jq '. | length'
+```
+
+### Test 3: WordPress Sync Test
+```bash
+# Trigger sync via WordPress
+curl -X POST http://localhost:8088/wp-json/palmo/v1/sync \
+  -H "X-WP-Nonce: $(curl http://localhost:8088/wp-json/palmo/v1/submissions 2>/dev/null | jq -r '.nonce // "missing"')" \
+  -v 2>&1 | tee /tmp/sync-response.txt
+
+# Check WordPress database
+docker compose exec mysql mysql -u palmotrans_user -pPalmoTrans2024Secure palmotrans_local \
+  -e "SELECT COUNT(*) as total, status FROM wp_palmo_submissions GROUP BY status;"
+```
+
+### Test 4: Email Test
+```bash
+# Check MailHog
+curl http://localhost:8025/api/v1/messages 2>/dev/null | jq '.' | head -50
+
+# Count emails
+curl http://localhost:8025/api/v1/messages 2>/dev/null | jq '.total // 0'
+```
+
+---
+
+## FAZA 4: ROOT CAUSE ANALYSIS (15 min)
+
+Jeśli testy failują, systematycznie sprawdzaj:
+
+### A. Backend Routes Registration
+```typescript
+// Check src/server.ts
+- [ ] app.use(cors()) — PRZED routes!
+- [ ] app.use(express.json()) — presence
+- [ ] app.use('/api/submissions', submissionsRouter) — registered
+- [ ] Error handler at END — present?
+```
+
+### B. Controllers Logic
+```typescript
+// Check src/controllers/submissionsController.ts
+- [ ] getAll() — exists? returns Array?
+- [ ] create() — validates input?
+- [ ] Error handling — try/catch?
+- [ ] Return format — { success, data }?
+```
+
+### C. Database Mock vs Real
+```typescript
+// Check if using Map or MySQL
+const submissionsMap: Map<number, DeliverySubmission> = new Map();
+// IF Map-based: DATA LOST ON RESTART!
+// FIX: Add persistence or use real MySQL
+```
+
+### D. CORS Issues
+```typescript
+// Should be:
+app.use(cors({
+  origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+  credentials: true,
+}));
+
+// Check headers in response:
+curl -i http://localhost:5000/health | grep -i access-control
+```
+
+### E. Environment Variables
+```bash
+# Must have:
+FRONTEND_URL=http://localhost:5173
+SMTP_USER=your-email@gmail.com
+SMTP_PASS=your-password
+PAYPAL_CLIENT_ID=...
+PAYPAL_SECRET=...
+```
+
+---
+
+## FAZA 5: FIXES & PATCHES (25 min)
+
+### Fix 1: If Route Not Registered
+```typescript
+// server.ts
+const submissionsRouter = require('./routes/submissions');
+app.use('/api/submissions', submissionsRouter);
+console.log('✅ Routes registered');
+```
+
+### Fix 2: If CORS Missing
+```typescript
+// Add before routes
+const cors = require('cors');
+app.use(cors({
+  origin: 'http://localhost:5173',
+  credentials: true,
+}));
+```
+
+### Fix 3: If Mock DB Losing Data
+```typescript
+// Add persistence
+const fs = require('fs');
+function saveMockDB() {
+  fs.writeFileSync('db.json', JSON.stringify(Array.from(submissionsMap.entries())));
+}
+function loadMockDB() {
+  if (fs.existsSync('db.json')) {
+    submissionsMap = new Map(JSON.parse(fs.readFileSync('db.json')));
+  }
+}
+```
+
+### Fix 4: If Email Not Sending
+```typescript
+// emailService.ts — test SMTP
+const transporter = nodemailer.createTransport({
+  host: 'localhost',
+  port: 1025, // MailHog SMTP
+  logger: true,
+  debug: true
+});
+```
+
+### Fix 5: If WordPress Sync Failing
+```php
+// sync.php — add logging
+error_log('SYNC START: ' . json_encode($_POST));
+error_log('Backend URL: ' . get_option('palmo_backend_url'));
+error_log('Response: ' . $body);
+```
+
+---
+
+## FAZA 6: COMMIT & DOCUMENT (10 min)
+
+Dla każdej zmiany:
+```bash
+git add .
+git commit -m "fix: [problem description]
+
+- Issue: [co było nie tak]
+- Root cause: [dlaczego]
+- Solution: [jak naprawiłem]
+- Testing: [jak zweryfikowałem]"
+
+git push origin phase/2-admin-features
+```
+
+---
+
+## OUTPUTS REQUIRED
+
+Agent musi wygenerować:
+
+1. **debug-report.md**
+   - Findings (co znaleźliśmy)
+   - Root causes (dlaczego się psuje)
+   - Applied fixes (co naprawiłem)
+   - Test results (czy działa)
+
+2. **test-results.json**
+```json
+   {
+     "backend_health": "✅ PASS",
+     "api_submissions_get": "✅ PASS",
+     "api_submissions_post": "❌ FAIL: ...",
+     "database_sync": "✅ PASS",
+     "email_smtp": "⚠️ WARNING: ...",
+     "wordpress_rest_api": "✅ PASS"
+   }
+```
+
+3. **Applied Fixes**
+   - Modified files (with line numbers)
+   - Commit messages
+   - Breaking changes (if any)
+
+4. **Recommendations**
+   - For FAZA 3 (Production)
+   - For scaling
+   - For security
+
+---
+
+## SUCCESS CRITERIA
+```
+✅ Backend starts without errors
+✅ GET /api/submissions returns JSON
+✅ POST /submissions creates record
+✅ Data visible in WordPress table
+✅ CSV export works
+✅ Filters functional
+✅ Email sends via MailHog
+✅ No browser console errors
+✅ No backend terminal errors
+```
+
+---
+
+## ITERACYJNE DZIAŁANIE
+
+Powtarzaj:
+1. Test → 2. Analyze → 3. Fix → 4. Verify → 5. Commit → 6. Document
+
+Aż wszystkie testy zielone ✅
+```
+EOF
+```
+
+---
+
+## 📋 Jak Uruchomić Agent dla Qwen Code
+```bash
+# Zapisz oba pliki
+cat > ~/.qwen-config.yaml << 'CONFIG'
+model: qwen3-coder
+autonomy: full
+iterations: 5
+timeout: 3600
+repository: ~/Documents/GitHub/strony/palmo-trans-calculator-backend
+logging: verbose
+CONFIG
+
+# Uruchom agenta
+qwen run \
+  --config ~/.qwen-config.yaml \
+  --agent-file /agents/palmo-backend-debug-agent.md \
+  --master-prompt ~/palmo-debug-master-prompt.txt
+```
+
+---
+
+## ✅ Co Masz Teraz
+
+1. **Agent File** (`palmo-backend-debug-agent.md`) — szczegółowe instrukcje dla Qwen
+2. **Master Prompt** (`palmo-debug-master-prompt.txt`) — megaprompt dla Claude Sonnet
+3. **Autonomiczny workflow** — 6 faz z testami iteracyjnymi
+4. **Success criteria** — jasne warunki do spełnienia
+
+---
+
+**Gotów uruchomić agenta?** 🚀
+
+Czy chcesz żebym:
+1. ✅ **Uruchomił to lokalnie** (bez Qwen, za pomocą bash + Claude)
+2. 📝 **Ulepszył prompty** (bardziej szczegółowe)
+3. 🔧 **Dodał więcej testów** (np. load testing)
+4. 📊 **Stworzył dashboard** (monitoring w realtime)
