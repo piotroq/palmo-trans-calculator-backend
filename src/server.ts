@@ -7,6 +7,7 @@ import path from 'path';
 import submissionsRouter from './routes/submissions';
 import geocodeRouter from './routes/geocode';
 import paymentRouter from './routes/payments';
+import calculateV2Router from './routes/calculateV2';
 import { errorHandler } from './middleware/errorHandler';
 
 // Load environment variables from .env.local
@@ -39,6 +40,7 @@ app.use(express.urlencoded({ limit: '1mb', extended: true }));
 app.use('/api/submissions', submissionsRouter);
 app.use('/api/geocode', geocodeRouter);
 app.use('/api/payments', paymentRouter);
+app.use('/api/v2', calculateV2Router);
 
 // Health check
 app.get('/health', (req: Request, res: Response) => {
