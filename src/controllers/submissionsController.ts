@@ -7,11 +7,26 @@ import {
 import type { DeliverySubmission } from '../types';
 import { ApiError } from '../middleware/errorHandler';
 
-// Mock baza danych (später: MySQL)
-const submissions: Map<number, DeliverySubmission> = new Map();
+// Mock baza danych
+const submissionsMap: Map<number, DeliverySubmission> = new Map();
 let nextId = 1;
 
 export class SubmissionsController {
+  /**
+   * GET /api/submissions — lista wszystkich zgłoszeń
+   */
+  static async getAll(req: Request, res: Response, next: NextFunction) {
+    try {
+      const allSubmissions = Array.from(submissionsMap.values());
+      res.json(allSubmissions);
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
+   * POST /api/submissions — utwórz nowe zgłoszenie
+   */
   static async create(req: Request, res: Response, next: NextFunction) {
     try {
       const {
@@ -65,7 +80,7 @@ export class SubmissionsController {
         createdAt: new Date(),
       };
 
-      submissions.set(submission.id!, submission);
+      submissionsMap.set(submission.id!, submission);
 
       // Wyślij emaili
       await Promise.all([
@@ -84,6 +99,9 @@ export class SubmissionsController {
     }
   }
 
+  /**
+   * GET /api/submissions/:referenceNumber — pobierz po numerze referencyjnym
+   */
   static async getByReference(
     req: Request,
     res: Response,
@@ -92,7 +110,7 @@ export class SubmissionsController {
     try {
       const { referenceNumber } = req.params;
 
-      const submission = Array.from(submissions.values()).find(
+      const submission = Array.from(submissionsMap.values()).find(
         (s) => s.referenceNumber === referenceNumber
       );
 
@@ -106,11 +124,14 @@ export class SubmissionsController {
     }
   }
 
+  /**
+   * GET /api/submissions/email/:email — pobierz po emailu
+   */
   static async getByEmail(req: Request, res: Response, next: NextFunction) {
     try {
       const { email } = req.params;
 
-      const userSubmissions = Array.from(submissions.values())
+      const userSubmissions = Array.from(submissionsMap.values())
         .filter((s) => s.contactEmail === email)
         .sort((a, b) => (b.createdAt?.getTime() || 0) - (a.createdAt?.getTime() || 0))
         .slice(0, 10);
@@ -121,6 +142,9 @@ export class SubmissionsController {
     }
   }
 
+  /**
+   * PATCH /api/submissions/:id/status — zmień status
+   */
   static async updateStatus(
     req: Request,
     res: Response,
@@ -134,7 +158,7 @@ export class SubmissionsController {
         throw new ApiError(400, 'Nieprawidłowy status');
       }
 
-      const submission = submissions.get(parseInt(id as string));
+      const submission = submissionsMap.get(parseInt(id as string));
       if (!submission) {
         throw new ApiError(404, 'Zgłoszenie nie znalezione');
       }
