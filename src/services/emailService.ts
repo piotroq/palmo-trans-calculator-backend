@@ -1,15 +1,27 @@
 import nodemailer from 'nodemailer';
 import type { DeliverySubmission } from '../types';
 
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST,
-  port: parseInt(process.env.SMTP_PORT || '587'),
-  secure: false,
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASSWORD,
-  },
-});
+// Lazy initialization - ensure dotenv is loaded before creating transporter
+let transporter: ReturnType<typeof nodemailer.createTransport>;
+
+function getTransporter() {
+  if (!transporter) {
+    const smtpUser = process.env.SMTP_USER;
+    const smtpPass = process.env.SMTP_PASSWORD;
+    const needsAuth = smtpUser && smtpPass;
+    
+    transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST || 'localhost',
+      port: parseInt(process.env.SMTP_PORT || '1025'),
+      secure: false,
+      auth: needsAuth ? {
+        user: smtpUser,
+        pass: smtpPass,
+      } : undefined,
+    });
+  }
+  return transporter;
+}
 
 /**
  * Wyślij email do biura
@@ -44,7 +56,7 @@ export async function sendEmailToOffice(submission: DeliverySubmission) {
   `;
 
   try {
-    await transporter.sendMail({
+    await getTransporter().sendMail({
       from: process.env.SMTP_FROM,
       to: 'biuro@palmo-trans.com',
       subject,
@@ -90,7 +102,7 @@ export async function sendEmailToCustomer(submission: DeliverySubmission) {
   `;
 
   try {
-    await transporter.sendMail({
+    await getTransporter().sendMail({
       from: process.env.SMTP_FROM,
       to: submission.contactEmail,
       subject,

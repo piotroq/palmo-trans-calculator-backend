@@ -9,7 +9,13 @@ import { ApiError } from '../middleware/errorHandler';
 
 // Mock baza danych
 const submissionsMap: Map<number, DeliverySubmission> = new Map();
-let nextId = 1;
+
+// Atomic ID generator - uses timestamp + counter to avoid race conditions
+let idCounter = 0;
+function generateId(): number {
+  idCounter = (idCounter + 1) % 1000000;
+  return Math.floor(Date.now() / 1000) * 1000000 + idCounter;
+}
 
 export class SubmissionsController {
   /**
@@ -57,7 +63,7 @@ export class SubmissionsController {
       const referenceNumber = `PTR-${Date.now()}-${uuidv4().substring(0, 8).toUpperCase()}`;
 
       const submission: DeliverySubmission = {
-        id: nextId++,
+        id: generateId(),
         referenceNumber,
         pickupAddress,
         pickupLat: pickupCoords.lat,
