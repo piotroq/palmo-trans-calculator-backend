@@ -1,244 +1,226 @@
 /**
- * PALMO-TRANS Calculator v2 — Pricing Engine
+ * PricingEngine — Silnik kalkulacji cen PALMO-TRANS
  *
- * Centralny silnik kalkulacji cen.
- * Formuła: Cena = Base + (km × rate) + Services + TimeWindow
+ * Formuła:
+ *   total = basePrice + (distanceKm × pricePerKm) + servicesTotal + timeWindowSurcharge
+ *   + VAT (0% Reverse Charge lub 19% DE)
+ *
+ * Eksportuje: calculatePrice(), quickQuote(), isPricingError()
  */
 
-import { getVehicleById, type VehicleConfig } from '../config/vehicles';
 import {
-  getServiceById,
-  getTimeWindowById,
-  type AdditionalServiceConfig,
-  type TimeWindowConfig,
-} from '../config/services';
+  vehicles,
+  additionalServices,
+  timeWindows,
+} from '../config/pricing';
 
-// ─── TYPES ────────────────────────────────────────────────────
+// ─── Types ───────────────────────────────────────────────────
 
-export interface PriceCalculationRequest {
+export interface PricingParams {
   vehicleId: string;
   distanceKm: number;
   serviceIds: string[];
-  pickupTimeWindowId: string;
-  deliveryTimeWindowId: string;
-  /** Czy klient B2B spoza Niemiec (Reverse Charge 0% USt) */
-  isReverseCharge: boolean;
-}
-
-export interface PriceBreakdownItem {
-  id: string;
-  label: string;
-  labelDE: string;
-  amount: number;
-  type: 'vehicle_base' | 'distance' | 'service' | 'time_window' | 'payment_fee';
+  pickupTimeWindowId?: string;
+  deliveryTimeWindowId?: string;
+  isReverseCharge?: boolean;
 }
 
 export interface PricingResult {
-  vehicleId: string;
-  vehicleName: string;
-  vehicleCategory: 'express' | 'lkw';
-
-  // Składniki ceny
   vehicleBasePrice: number;
   distanceCharge: number;
   servicesTotal: number;
   pickupTimeWindowSurcharge: number;
   deliveryTimeWindowSurcharge: number;
-
-  // Podsumowanie
   subtotal: number;
-  vatRate: number; // 0.19 lub 0 (Reverse Charge)
+  vatRate: number;
   vatAmount: number;
   total: number;
-
-  // Metadane
   distanceKm: number;
   estimatedDuration: string;
-  pricePerKm: number;
   breakdown: PriceBreakdownItem[];
 }
 
-export interface PricingError {
-  code: string;
-  message: string;
-  field?: string;
+export interface PriceBreakdownItem {
+  label: string;
+  amount: number;
+  type: 'base' | 'distance' | 'service' | 'timeWindow' | 'vat';
 }
 
-// ─── MAIN CALCULATION ─────────────────────────────────────────
+export interface PricingError {
+  error: true;
+  message: string;
+}
 
-export function calculatePrice(req: PriceCalculationRequest): PricingResult | PricingError {
-  // 1. Walidacja pojazdu
-  const vehicle = getVehicleById(req.vehicleId);
+// ─── Type Guard ──────────────────────────────────────────────
+
+export function isPricingError(result: PricingResult | QuickQuoteResult | PricingError): result is PricingError {
+  return 'error' in result && result.error === true;
+}
+
+// ─── Full Price Calculator ───────────────────────────────────
+
+export function calculatePrice(params: PricingParams): PricingResult | PricingError {
+  const {
+    vehicleId,
+    distanceKm,
+    serviceIds = [],
+    pickupTimeWindowId = 'TW-6H',
+    deliveryTimeWindowId = 'TW-6H',
+    isReverseCharge = false,
+  } = params;
+
+  const vehicle = vehicles.find((v) => v.id === vehicleId);
   if (!vehicle) {
-    return { code: 'INVALID_VEHICLE', message: `Unknown vehicle ID: ${req.vehicleId}`, field: 'vehicleId' };
+    return { error: true, message: `Unbekanntes Fahrzeug: ${vehicleId}` };
   }
 
-  // 2. Walidacja dystansu
-  if (req.distanceKm <= 0 || !Number.isFinite(req.distanceKm)) {
-    return { code: 'INVALID_DISTANCE', message: 'Distance must be positive', field: 'distanceKm' };
+  if (distanceKm <= 0) {
+    return { error: true, message: 'Entfernung muss größer als 0 sein' };
   }
 
-  // 3. Walidacja usług — sprawdź czy dostępne dla kategorii pojazdu
-  const validatedServices: AdditionalServiceConfig[] = [];
-  for (const svcId of req.serviceIds) {
-    const service = getServiceById(svcId);
-    if (!service) {
-      return { code: 'INVALID_SERVICE', message: `Unknown service ID: ${svcId}`, field: 'serviceIds' };
-    }
-    if (!service.availableFor.includes(vehicle.category)) {
-      return {
-        code: 'SERVICE_NOT_AVAILABLE',
-        message: `Service "${service.name}" is not available for ${vehicle.category} vehicles`,
-        field: 'serviceIds',
-      };
-    }
-    if (!vehicle.availableServices.includes(svcId)) {
-      return {
-        code: 'SERVICE_NOT_COMPATIBLE',
-        message: `Service "${service.name}" is not compatible with vehicle "${vehicle.name}"`,
-        field: 'serviceIds',
-      };
-    }
-    validatedServices.push(service);
-  }
-
-  // 4. Time windows
-  const pickupTW = getTimeWindowById(req.pickupTimeWindowId);
-  const deliveryTW = getTimeWindowById(req.deliveryTimeWindowId);
-  if (!pickupTW) {
-    return { code: 'INVALID_TIME_WINDOW', message: `Unknown pickup time window: ${req.pickupTimeWindowId}`, field: 'pickupTimeWindowId' };
-  }
-  if (!deliveryTW) {
-    return { code: 'INVALID_TIME_WINDOW', message: `Unknown delivery time window: ${req.deliveryTimeWindowId}`, field: 'deliveryTimeWindowId' };
-  }
-
-  // 5. Kalkulacja
+  // Cena bazowa + dystans
   const vehicleBasePrice = vehicle.basePrice;
-  const distanceCharge = round2(req.distanceKm * vehicle.pricePerKm);
-  const servicesTotal = round2(validatedServices.reduce((sum, s) => sum + s.price, 0));
-  const pickupTimeWindowSurcharge = pickupTW.surcharge[vehicle.category];
-  const deliveryTimeWindowSurcharge = deliveryTW.surcharge[vehicle.category];
+  const distanceCharge = round(distanceKm * vehicle.pricePerKm);
 
-  const subtotal = round2(
-    vehicleBasePrice + distanceCharge + servicesTotal + pickupTimeWindowSurcharge + deliveryTimeWindowSurcharge
-  );
-
-  // VAT: 0% dla Reverse Charge (B2B spoza DE), 19% normalnie
-  const vatRate = req.isReverseCharge ? 0 : 0.19;
-  const vatAmount = round2(subtotal * vatRate);
-  const total = round2(subtotal + vatAmount);
-
-  // 6. Breakdown
+  // Breakdown
   const breakdown: PriceBreakdownItem[] = [
-    {
-      id: 'base',
-      label: `${vehicle.name} (base)`,
-      labelDE: `${vehicle.nameDE} (Grundpreis)`,
-      amount: vehicleBasePrice,
-      type: 'vehicle_base',
-    },
-    {
-      id: 'distance',
-      label: `${req.distanceKm} km × ${vehicle.pricePerKm} zł/km`,
-      labelDE: `${req.distanceKm} km × ${vehicle.pricePerKm} zł/km`,
-      amount: distanceCharge,
-      type: 'distance',
-    },
-    ...validatedServices.map((s) => ({
-      id: s.id,
-      label: s.name,
-      labelDE: s.nameDE,
-      amount: s.price,
-      type: 'service' as const,
-    })),
+    { label: vehicle.nameDE, amount: vehicleBasePrice, type: 'base' },
+    { label: `${distanceKm} km × ${vehicle.pricePerKm.toFixed(2)} zł/km`, amount: distanceCharge, type: 'distance' },
   ];
 
-  if (pickupTimeWindowSurcharge > 0) {
-    breakdown.push({
-      id: 'pickup-tw',
-      label: `Pickup: ${pickupTW.name}`,
-      labelDE: `Abholung: ${pickupTW.nameDE}`,
-      amount: pickupTimeWindowSurcharge,
-      type: 'time_window',
-    });
-  }
-  if (deliveryTimeWindowSurcharge > 0) {
-    breakdown.push({
-      id: 'delivery-tw',
-      label: `Delivery: ${deliveryTW.name}`,
-      labelDE: `Zustellung: ${deliveryTW.nameDE}`,
-      amount: deliveryTimeWindowSurcharge,
-      type: 'time_window',
-    });
+  // Usługi dodatkowe
+  let servicesTotal = 0;
+  for (const svcId of serviceIds) {
+    const svc = additionalServices.find((s) => s.id === svcId);
+    if (!svc || !svc.availableFor.includes(vehicle.category)) continue;
+    servicesTotal += svc.price;
+    breakdown.push({ label: svc.nameDE, amount: svc.price, type: 'service' });
   }
 
+  // Time window surcharges
+  const pickupTW = timeWindows.find((tw) => tw.id === pickupTimeWindowId);
+  const deliveryTW = timeWindows.find((tw) => tw.id === deliveryTimeWindowId);
+
+  const pickupSurcharge = pickupTW ? pickupTW.surcharge[vehicle.category] : 0;
+  const deliverySurcharge = deliveryTW ? deliveryTW.surcharge[vehicle.category] : 0;
+
+  if (pickupSurcharge > 0) {
+    breakdown.push({ label: `Abhol-Zeitfenster: ${pickupTW!.nameDE}`, amount: pickupSurcharge, type: 'timeWindow' });
+  }
+  if (deliverySurcharge > 0) {
+    breakdown.push({ label: `Zustell-Zeitfenster: ${deliveryTW!.nameDE}`, amount: deliverySurcharge, type: 'timeWindow' });
+  }
+
+  // Subtotal + VAT
+  const subtotal = round(vehicleBasePrice + distanceCharge + servicesTotal + pickupSurcharge + deliverySurcharge);
+
+  // 0% domyślnie (Reverse Charge B2B EU). Zmień na 0.19 jeśli klienci DE B2C.
+  const vatRate = isReverseCharge ? 0 : 0;
+  const vatAmount = round(subtotal * vatRate);
+  const total = round(subtotal + vatAmount);
+
+  if (vatAmount > 0) {
+    breakdown.push({ label: `MwSt. ${(vatRate * 100).toFixed(0)}%`, amount: vatAmount, type: 'vat' });
+  }
+
+  // Szacowany czas (~60 km/h)
+  const mins = Math.round(distanceKm / 60 * 60);
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  const estimatedDuration = h > 0 ? `${h}h ${m.toString().padStart(2, '0')}min` : `${m}min`;
+
   return {
-    vehicleId: vehicle.id,
-    vehicleName: vehicle.nameDE,
-    vehicleCategory: vehicle.category,
     vehicleBasePrice,
     distanceCharge,
-    servicesTotal,
-    pickupTimeWindowSurcharge,
-    deliveryTimeWindowSurcharge,
+    servicesTotal: round(servicesTotal),
+    pickupTimeWindowSurcharge: pickupSurcharge,
+    deliveryTimeWindowSurcharge: deliverySurcharge,
     subtotal,
     vatRate,
     vatAmount,
     total,
-    distanceKm: req.distanceKm,
-    estimatedDuration: estimateDuration(req.distanceKm),
-    pricePerKm: vehicle.pricePerKm,
+    distanceKm,
+    estimatedDuration,
     breakdown,
   };
 }
 
-// ─── QUICK QUOTE (Step 1 — tylko pojazd + dystans) ────────────
+// ─── Quick Quote (uproszczona — Step 1 frontend) ─────────────
 
-export interface QuickQuoteRequest {
+export interface QuickQuoteParams {
   vehicleId: string;
   distanceKm: number;
   serviceIds?: string[];
 }
 
-export function calculateQuickQuote(req: QuickQuoteRequest): { price: number; vehicleName: string } | PricingError {
-  const vehicle = getVehicleById(req.vehicleId);
+export interface QuickQuoteResult {
+  vehicleBasePrice: number;
+  distanceCharge: number;
+  servicesTotal: number;
+  total: number;
+  pricePerKm: number;
+  vehicleName: string;
+}
+
+export function quickQuote(params: QuickQuoteParams): QuickQuoteResult | PricingError {
+  const vehicle = vehicles.find((v) => v.id === params.vehicleId);
   if (!vehicle) {
-    return { code: 'INVALID_VEHICLE', message: `Unknown vehicle ID: ${req.vehicleId}` };
-  }
-  if (req.distanceKm <= 0) {
-    return { code: 'INVALID_DISTANCE', message: 'Distance must be positive' };
+    return { error: true, message: `Unbekanntes Fahrzeug: ${params.vehicleId}` };
   }
 
-  let price = vehicle.basePrice + req.distanceKm * vehicle.pricePerKm;
+  if (params.distanceKm <= 0) {
+    return { error: true, message: 'Entfernung muss größer als 0 sein' };
+  }
 
-  // Opcjonalnie dodaj usługi
-  if (req.serviceIds?.length) {
-    for (const svcId of req.serviceIds) {
-      const svc = getServiceById(svcId);
-      if (svc) price += svc.price;
+  const vehicleBasePrice = vehicle.basePrice;
+  const distanceCharge = round(params.distanceKm * vehicle.pricePerKm);
+
+  let servicesTotal = 0;
+  for (const svcId of (params.serviceIds || [])) {
+    const svc = additionalServices.find((s) => s.id === svcId);
+    if (svc && svc.availableFor.includes(vehicle.category)) {
+      servicesTotal += svc.price;
     }
   }
 
-  return { price: round2(price), vehicleName: vehicle.nameDE };
+  return {
+    vehicleBasePrice,
+    distanceCharge,
+    servicesTotal: round(servicesTotal),
+    total: round(vehicleBasePrice + distanceCharge + servicesTotal),
+    pricePerKm: vehicle.pricePerKm,
+    vehicleName: vehicle.nameDE,
+  };
 }
 
-// ─── HELPERS ──────────────────────────────────────────────────
+// ─── All Vehicles Quick Prices (dla listy pojazdów w Step 1) ──
 
-function round2(value: number): number {
-  return Math.round(value * 100) / 100;
+export interface VehiclePriceListItem {
+  vehicleId: string;
+  vehicleName: string;
+  category: 'express' | 'lkw';
+  basePrice: number;
+  distanceCharge: number;
+  total: number;
+  pricePerKm: number;
 }
 
-/** Szacowany czas jazdy (uproszczony: ~70 km/h średnia) */
-function estimateDuration(distanceKm: number): string {
-  const hours = Math.floor(distanceKm / 70);
-  const minutes = Math.round(((distanceKm / 70) % 1) * 60);
+export function allVehiclePrices(distanceKm: number): VehiclePriceListItem[] {
+  if (distanceKm <= 0) return [];
 
-  if (hours === 0) return `${minutes} min`;
-  if (minutes === 0) return `${hours}:00 h`;
-  return `${hours}:${minutes.toString().padStart(2, '0')} h`;
+  return vehicles.map((v) => ({
+    vehicleId: v.id,
+    vehicleName: v.nameDE,
+    category: v.category,
+    basePrice: v.basePrice,
+    distanceCharge: round(distanceKm * v.pricePerKm),
+    total: round(v.basePrice + distanceKm * v.pricePerKm),
+    pricePerKm: v.pricePerKm,
+  }));
 }
 
-/** Sprawdź czy wynik jest błędem */
-export function isPricingError(result: PricingResult | PricingError): result is PricingError {
-  return 'code' in result;
+// ─── Helper ──────────────────────────────────────────────────
+
+function round(n: number): number {
+  return Math.round(n * 100) / 100;
 }
